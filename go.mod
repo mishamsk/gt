@@ -1,4 +1,4 @@
-module github.com/alex/gt
+module github.com/melonamin/gt
 
 go 1.23.0
 
