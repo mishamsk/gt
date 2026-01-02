@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,13 +22,26 @@ const (
 	defaultWorktreeDir = ".worktrees"
 	configFileName     = "config.json"
 	configDirName      = "gt"
+
+	// UI constants
+	maxCommitMsgLength   = 40
+	statusMessageTimeout = 3 * time.Second
+	refreshTimeout       = 2 * time.Second
+	minViewportHeight    = 5
+	viewportPadding      = 8 // Lines for header/footer
+	hashDisplayLength    = 7
+	branchDisplayWidth   = 20
+	ellipsis             = "..."
 )
 
+// Config holds user configuration loaded from ~/.config/gt/config.json.
 type Config struct {
 	WorktreeDir string `json:"worktree_dir,omitempty"`
 	Shell       string `json:"shell,omitempty"`
+	PostCreate  string `json:"post_create,omitempty"`
 }
 
+// Worktree represents a git worktree with its associated metadata.
 type Worktree struct {
 	Path       string
 	Branch     string
@@ -32,8 +49,11 @@ type Worktree struct {
 	IsDirty    bool
 	LastCommit CommitInfo
 	IsCurrent  bool
+	Ahead      int
+	Behind     int
 }
 
+// CommitInfo holds metadata about a git commit.
 type CommitInfo struct {
 	Hash    string
 	Message string
@@ -41,34 +61,75 @@ type CommitInfo struct {
 	Author  string
 }
 
-type model struct {
-	worktrees      []Worktree
-	filtered       []Worktree
-	cursor         int
-	scrollOffset   int
-	searchTerm     string
-	width          int
-	height         int
-	quitting       bool
-	inputMode      inputMode
-	inputValue     string
-	confirmDelete  bool
-	deleteTarget   *Worktree
-	repoPath       string
-	config         *Config
-	err            error
-	statusMessage  string
-	statusTimeout  time.Time
-}
-
+// inputMode represents the current input state of the TUI.
 type inputMode int
 
 const (
-	modeNormal inputMode = iota
-	modeSearch
-	modeNewBranch
-	modeNewPath
+	modeNormal    inputMode = iota // Browsing worktrees
+	modeSearch                     // Inline search filtering
+	modeNewBranch                  // Entering new branch name
+	modeNewPath                    // Entering custom worktree path
+	modeActions                    // Selecting from actions menu
 )
+
+// actionFn is the signature for worktree action handlers.
+type actionFn func(wt *Worktree, config *Config) error
+
+// action represents a menu action that can be performed on a worktree.
+type action struct {
+	key          string
+	label        string
+	fn           actionFn
+	exitAfterRun bool // If false, return to TUI after action completes
+	darwinOnly   bool // If true, only available on macOS
+}
+
+// uiState holds the UI-related state for the TUI.
+type uiState struct {
+	cursor       int
+	scrollOffset int
+	width        int
+	height       int
+	inputMode    inputMode
+	inputValue   string
+}
+
+// worktreeState holds worktree-related data.
+type worktreeState struct {
+	worktrees        []Worktree
+	filtered         []Worktree
+	searchTerm       string
+	defaultBranch    string
+	previousWorktree string
+}
+
+// actionsState holds the state for the actions menu.
+type actionsState struct {
+	cursor  int
+	actions []action
+}
+
+// deleteState holds the state for delete confirmation.
+type deleteState struct {
+	confirming bool
+	target     *Worktree
+}
+
+// model is the Bubble Tea model for the TUI application.
+type model struct {
+	ui       uiState
+	wt       worktreeState
+	acts     actionsState
+	del      deleteState
+	repoPath string
+	config   *Config
+	err      error
+	status   struct {
+		message string
+		timeout time.Time
+	}
+	quitting bool
+}
 
 var (
 	titleStyle = lipgloss.NewStyle().
@@ -107,7 +168,69 @@ var (
 
 	successStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("82"))
+
+	aheadStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("82"))
+
+	behindStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214"))
 )
+
+// printInfo prints a dimmed informational message to stdout.
+func printInfo(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Printf("\n\033[2m%s\033[0m\n", msg)
+}
+
+// validateBranchName checks if the given name is valid for a git branch.
+func validateBranchName(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("branch name cannot be empty")
+	}
+	if strings.HasPrefix(name, "-") {
+		return errors.New("branch name cannot start with '-'")
+	}
+	if strings.HasPrefix(name, ".") {
+		return errors.New("branch name cannot start with '.'")
+	}
+	if strings.HasSuffix(name, ".") {
+		return errors.New("branch name cannot end with '.'")
+	}
+	if strings.HasSuffix(name, ".lock") {
+		return errors.New("branch name cannot end with '.lock'")
+	}
+	if strings.Contains(name, "..") {
+		return errors.New("branch name cannot contain '..'")
+	}
+	if strings.Contains(name, " ") {
+		return errors.New("branch name cannot contain spaces")
+	}
+	if strings.Contains(name, "~") || strings.Contains(name, "^") ||
+		strings.Contains(name, ":") || strings.Contains(name, "?") ||
+		strings.Contains(name, "*") || strings.Contains(name, "[") ||
+		strings.Contains(name, "\\") {
+		return errors.New("branch name contains invalid characters")
+	}
+	// Shell metacharacters that could be dangerous in command execution
+	if strings.Contains(name, ";") || strings.Contains(name, "&") ||
+		strings.Contains(name, "|") || strings.Contains(name, "$") ||
+		strings.Contains(name, "`") || strings.Contains(name, "(") ||
+		strings.Contains(name, ")") || strings.Contains(name, "<") ||
+		strings.Contains(name, ">") {
+		return errors.New("branch name contains invalid characters")
+	}
+	return nil
+}
+
+// truncateString truncates a string to maxLen runes and adds ellipsis if needed.
+func truncateString(s string, maxLen int) string {
+	if utf8.RuneCountInString(s) <= maxLen {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxLen]) + ellipsis
+}
 
 func getConfigPath() string {
 	configHome, err := os.UserConfigDir()
@@ -161,6 +284,41 @@ func getCurrentRepoPath() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// getAheadBehind returns the number of commits the branch is ahead/behind the default branch.
+// Returns (0, 0) if the branch is the default branch, or if any error occurs during git operations.
+func getAheadBehind(worktreePath, branch, defaultBranch string) (ahead, behind int) {
+	if branch == "" || branch == defaultBranch {
+		return 0, 0
+	}
+
+	// Get count of commits ahead and behind
+	cmd := exec.Command("git", "rev-list", "--left-right", "--count", fmt.Sprintf("%s...%s", defaultBranch, branch))
+	cmd.Dir = worktreePath
+	output, err := cmd.Output()
+	if err != nil {
+		// Git command failed (e.g., branch doesn't exist in remote, or not a valid ref)
+		// Silently return 0,0 as this is a non-critical display feature
+		return 0, 0
+	}
+
+	parts := strings.Fields(strings.TrimSpace(string(output)))
+	if len(parts) != 2 {
+		// Unexpected output format
+		return 0, 0
+	}
+
+	behindVal, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0
+	}
+	aheadVal, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0
+	}
+
+	return aheadVal, behindVal
+}
+
 func getWorktrees(repoPath string) ([]Worktree, error) {
 	cmd := exec.Command("git", "worktree", "list", "--porcelain")
 	cmd.Dir = repoPath
@@ -169,9 +327,12 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 		return nil, err
 	}
 
+	// Get default branch early for ahead/behind calculation
+	defaultBranch := getDefaultBranch(repoPath)
+
 	var worktrees []Worktree
 	lines := strings.Split(string(output), "\n")
-	
+
 	var current Worktree
 	for _, line := range lines {
 		if strings.HasPrefix(line, "worktree ") {
@@ -197,11 +358,11 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 
 	// Get current directory to mark current worktree
 	cwd, _ := os.Getwd()
-	
+
 	// Get additional info for each worktree
 	for i := range worktrees {
 		worktrees[i].IsCurrent = strings.HasPrefix(cwd, worktrees[i].Path)
-		
+
 		// Check if dirty
 		cmd := exec.Command("git", "status", "--porcelain")
 		cmd.Dir = worktrees[i].Path
@@ -217,7 +378,11 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 		if err == nil && len(output) > 0 {
 			parts := strings.Split(string(output), "|")
 			if len(parts) >= 4 {
-				worktrees[i].LastCommit.Hash = parts[0][:7]
+				hash := parts[0]
+				if len(hash) > hashDisplayLength {
+					hash = hash[:hashDisplayLength]
+				}
+				worktrees[i].LastCommit.Hash = hash
 				worktrees[i].LastCommit.Message = parts[1]
 				if t, err := time.Parse("2006-01-02 15:04:05 -0700", parts[2]); err == nil {
 					worktrees[i].LastCommit.Date = t
@@ -225,6 +390,9 @@ func getWorktrees(repoPath string) ([]Worktree, error) {
 				worktrees[i].LastCommit.Author = parts[3]
 			}
 		}
+
+		// Get ahead/behind count relative to default branch
+		worktrees[i].Ahead, worktrees[i].Behind = getAheadBehind(worktrees[i].Path, worktrees[i].Branch, defaultBranch)
 	}
 
 	return worktrees, nil
@@ -281,6 +449,88 @@ func formatRelativeTime(t time.Time) string {
 	}
 }
 
+// getActions returns the list of available worktree actions, filtered by platform.
+func getActions() []action {
+	allActions := []action{
+		{
+			key:          "e",
+			label:        "Open in editor ($EDITOR)",
+			exitAfterRun: true,
+			fn: func(wt *Worktree, config *Config) error {
+				editor := os.Getenv("EDITOR")
+				if editor == "" {
+					editor = "vim"
+				}
+				cmd := exec.Command(editor, wt.Path)
+				cmd.Stdin = os.Stdin
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				return cmd.Run()
+			},
+		},
+		{
+			key:          "c",
+			label:        "Open in VS Code",
+			exitAfterRun: true,
+			fn: func(wt *Worktree, config *Config) error {
+				if _, err := exec.LookPath("code"); err != nil {
+					return errors.New("VS Code not found (command 'code' not in PATH)")
+				}
+				cmd := exec.Command("code", wt.Path)
+				return cmd.Run()
+			},
+		},
+		{
+			key:          "t",
+			label:        "Open terminal here",
+			exitAfterRun: true,
+			fn: func(wt *Worktree, config *Config) error {
+				shell := getShell(config)
+				cmd := exec.Command(shell)
+				cmd.Dir = wt.Path
+				cmd.Stdin = os.Stdin
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				return cmd.Run()
+			},
+		},
+		{
+			key:          "f",
+			label:        "Open in Finder",
+			exitAfterRun: false, // Can stay in TUI
+			darwinOnly:   true,
+			fn: func(wt *Worktree, config *Config) error {
+				cmd := exec.Command("open", wt.Path)
+				return cmd.Run()
+			},
+		},
+		{
+			key:          "p",
+			label:        "Copy path to clipboard",
+			exitAfterRun: false, // Stay in TUI after copy
+			darwinOnly:   true,
+			fn: func(wt *Worktree, config *Config) error {
+				cmd := exec.Command("pbcopy")
+				cmd.Stdin = strings.NewReader(wt.Path)
+				return cmd.Run()
+			},
+		},
+	}
+
+	// Filter actions by platform
+	if runtime.GOOS == "darwin" {
+		return allActions
+	}
+
+	var filtered []action
+	for _, a := range allActions {
+		if !a.darwinOnly {
+			filtered = append(filtered, a)
+		}
+	}
+	return filtered
+}
+
 func initialModel() model {
 	repoPath, err := getCurrentRepoPath()
 	if err != nil {
@@ -297,14 +547,32 @@ func initialModel() model {
 		return model{err: err}
 	}
 
-	m := model{
-		worktrees: worktrees,
-		filtered:  worktrees,
-		repoPath:  repoPath,
-		config:    config,
+	// Get default branch for ^ shortcut
+	defaultBranch := getDefaultBranch(repoPath)
+
+	// Find current worktree path for tracking previous (session-only)
+	var currentPath string
+	for _, wt := range worktrees {
+		if wt.IsCurrent {
+			currentPath = wt.Path
+			break
+		}
 	}
 
-	return m
+	return model{
+		ui: uiState{},
+		wt: worktreeState{
+			worktrees:        worktrees,
+			filtered:         worktrees,
+			defaultBranch:    defaultBranch,
+			previousWorktree: currentPath,
+		},
+		acts: actionsState{
+			actions: getActions(),
+		},
+		repoPath: repoPath,
+		config:   config,
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -319,189 +587,339 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+// setStatus sets a status message that will be displayed temporarily.
+func (m *model) setStatus(msg string, timeout time.Duration) {
+	m.status.message = msg
+	m.status.timeout = time.Now().Add(timeout)
+}
+
+// refreshWorktrees reloads the worktree list from git.
+func (m *model) refreshWorktrees() {
+	worktrees, err := getWorktrees(m.repoPath)
+	if err != nil {
+		m.setStatus(fmt.Sprintf("Refresh failed: %v", err), statusMessageTimeout)
+		return
+	}
+	m.wt.worktrees = worktrees
+	m.wt.filtered = filterWorktrees(worktrees, m.wt.searchTerm)
+}
+
+// clampScroll adjusts scroll offset to keep the cursor visible within the viewport.
+func (m *model) clampScroll() {
+	viewportHeight := m.ui.height - viewportPadding
+	if viewportHeight < minViewportHeight {
+		viewportHeight = minViewportHeight
+	}
+
+	if m.ui.cursor >= m.ui.scrollOffset+viewportHeight {
+		m.ui.scrollOffset = m.ui.cursor - viewportHeight + 1
+	} else if m.ui.cursor < m.ui.scrollOffset {
+		m.ui.scrollOffset = m.ui.cursor
+	}
+}
+
+// handleDeleteConfirm handles key input during delete confirmation.
+func (m model) handleDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		if m.del.target != nil {
+			if err := deleteWorktree(m.repoPath, m.del.target.Path); err != nil {
+				m.err = err
+			} else {
+				m.setStatus(fmt.Sprintf("Deleted worktree: %s", m.del.target.Branch), statusMessageTimeout)
+				m.refreshWorktrees()
+			}
+		}
+		m.del.confirming = false
+		m.del.target = nil
+		return m, tickCmd()
+	case "n", "N", "esc", "ctrl+c":
+		m.del.confirming = false
+		m.del.target = nil
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleSearchMode handles key input during search mode.
+func (m model) handleSearchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.ui.inputMode = modeNormal
+		m.wt.searchTerm = ""
+		m.wt.filtered = m.wt.worktrees
+		return m, nil
+	case "enter":
+		m.ui.inputMode = modeNormal
+		return m, nil
+	case "backspace":
+		if len(m.wt.searchTerm) > 0 {
+			m.wt.searchTerm = m.wt.searchTerm[:len(m.wt.searchTerm)-1]
+			m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
+		}
+		return m, nil
+	default:
+		if len(msg.String()) == 1 {
+			m.wt.searchTerm += msg.String()
+			m.wt.filtered = filterWorktrees(m.wt.worktrees, m.wt.searchTerm)
+		}
+		return m, nil
+	}
+}
+
+// handleNewBranchMode handles key input during new branch creation.
+func (m model) handleNewBranchMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.ui.inputMode = modeNormal
+		m.ui.inputValue = ""
+		return m, nil
+	case "enter":
+		if m.ui.inputValue != "" {
+			if err := validateBranchName(m.ui.inputValue); err != nil {
+				m.err = err
+			} else if err := createWorktree(m.repoPath, m.ui.inputValue, m.config); err != nil {
+				m.err = err
+			} else {
+				m.setStatus(fmt.Sprintf("Created worktree: %s", m.ui.inputValue), statusMessageTimeout)
+				m.refreshWorktrees()
+			}
+		}
+		m.ui.inputMode = modeNormal
+		m.ui.inputValue = ""
+		return m, tickCmd()
+	case "backspace":
+		if len(m.ui.inputValue) > 0 {
+			m.ui.inputValue = m.ui.inputValue[:len(m.ui.inputValue)-1]
+		}
+		return m, nil
+	default:
+		if len(msg.String()) == 1 || msg.String() == "/" || msg.String() == "-" {
+			m.ui.inputValue += msg.String()
+		}
+		return m, nil
+	}
+}
+
+// runAction executes an action and handles whether to exit or stay in TUI.
+func (m model) runAction(action action, wt *Worktree) (tea.Model, tea.Cmd) {
+	m.ui.inputMode = modeNormal
+
+	if action.exitAfterRun {
+		m.quitting = true
+		printInfo("Running: %s", action.label)
+		if err := action.fn(wt, m.config); err != nil {
+			fmt.Fprintf(os.Stderr, "Action failed: %v\n", err)
+		}
+		return m, tea.Quit
+	}
+
+	// Non-exiting action: run and show status
+	if err := action.fn(wt, m.config); err != nil {
+		m.setStatus(fmt.Sprintf("Action failed: %v", err), statusMessageTimeout)
+	} else {
+		m.setStatus(fmt.Sprintf("%s completed", action.label), refreshTimeout)
+	}
+	return m, tickCmd()
+}
+
+// handleActionsMode handles key input during action selection.
+func (m model) handleActionsMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "ctrl+c", "q":
+		m.ui.inputMode = modeNormal
+		return m, nil
+	case "up", "k":
+		if m.acts.cursor > 0 {
+			m.acts.cursor--
+		}
+		return m, nil
+	case "down", "j":
+		if m.acts.cursor < len(m.acts.actions)-1 {
+			m.acts.cursor++
+		}
+		return m, nil
+	case "enter":
+		if m.ui.cursor < len(m.wt.filtered) && m.acts.cursor < len(m.acts.actions) {
+			wt := m.wt.filtered[m.ui.cursor]
+			action := m.acts.actions[m.acts.cursor]
+			return m.runAction(action, &wt)
+		}
+		return m, nil
+	default:
+		// Check for action shortcut keys
+		for _, action := range m.acts.actions {
+			if msg.String() == action.key {
+				if m.ui.cursor < len(m.wt.filtered) {
+					wt := m.wt.filtered[m.ui.cursor]
+					return m.runAction(action, &wt)
+				}
+			}
+		}
+		return m, nil
+	}
+}
+
+// handleNormalMode handles key input during normal browsing mode.
+func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		m.quitting = true
+		return m, tea.Quit
+
+	case "up", "k":
+		if m.ui.cursor > 0 {
+			m.ui.cursor--
+			m.clampScroll()
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.ui.cursor < len(m.wt.filtered)-1 {
+			m.ui.cursor++
+			m.clampScroll()
+		}
+		return m, nil
+
+	case "/":
+		m.ui.inputMode = modeSearch
+		m.wt.searchTerm = ""
+		return m, nil
+
+	case "n":
+		m.ui.inputMode = modeNewBranch
+		m.ui.inputValue = ""
+		return m, nil
+
+	case "d":
+		if m.ui.cursor < len(m.wt.filtered) {
+			wt := &m.wt.filtered[m.ui.cursor]
+			if strings.HasSuffix(m.repoPath, wt.Path) {
+				m.err = fmt.Errorf("cannot delete main worktree")
+				return m, nil
+			}
+			m.del.confirming = true
+			m.del.target = wt
+		}
+		return m, nil
+
+	case "r":
+		m.refreshWorktrees()
+		m.setStatus("Refreshed", refreshTimeout)
+		return m, tickCmd()
+
+	case "^":
+		for i, wt := range m.wt.filtered {
+			if wt.Branch == m.wt.defaultBranch {
+				m.ui.cursor = i
+				m.clampScroll()
+				m.setStatus(fmt.Sprintf("Jumped to default branch: %s", m.wt.defaultBranch), refreshTimeout)
+				break
+			}
+		}
+		return m, tickCmd()
+
+	case "-":
+		if m.wt.previousWorktree != "" {
+			for i, wt := range m.wt.filtered {
+				if wt.Path == m.wt.previousWorktree {
+					m.ui.cursor = i
+					m.clampScroll()
+					m.setStatus("Jumped to previous worktree (session)", refreshTimeout)
+					break
+				}
+			}
+		}
+		return m, tickCmd()
+
+	case "@":
+		for i, wt := range m.wt.filtered {
+			if wt.IsCurrent {
+				m.ui.cursor = i
+				m.clampScroll()
+				m.setStatus("Jumped to current worktree", refreshTimeout)
+				break
+			}
+		}
+		return m, tickCmd()
+
+	case "a":
+		if m.ui.cursor < len(m.wt.filtered) {
+			m.ui.inputMode = modeActions
+			m.acts.cursor = 0
+		}
+		return m, nil
+
+	case "enter":
+		if m.ui.cursor < len(m.wt.filtered) {
+			wt := m.wt.filtered[m.ui.cursor]
+
+			// Track previous worktree before switching (session-only)
+			for _, w := range m.wt.worktrees {
+				if w.IsCurrent {
+					m.wt.previousWorktree = w.Path
+					break
+				}
+			}
+
+			m.quitting = true
+			printInfo("Switching to %s...", wt.Path)
+
+			if err := os.Chdir(wt.Path); err != nil {
+				m.err = err
+				return m, nil
+			}
+
+			shell := getShell(m.config)
+			cmd := exec.Command(shell)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Dir = wt.Path
+
+			return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
+				if err != nil {
+					return err
+				}
+				return tea.Quit()
+			})
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		m.ui.width = msg.Width
+		m.ui.height = msg.Height
 		return m, nil
 
 	case tickMsg:
-		if !m.statusTimeout.IsZero() && time.Now().After(m.statusTimeout) {
-			m.statusMessage = ""
-			m.statusTimeout = time.Time{}
+		if !m.status.timeout.IsZero() && time.Now().After(m.status.timeout) {
+			m.status.message = ""
+			m.status.timeout = time.Time{}
 		}
 		return m, tickCmd()
 
 	case tea.KeyMsg:
-		if m.confirmDelete {
-			switch msg.String() {
-			case "y", "Y":
-				if m.deleteTarget != nil {
-					if err := deleteWorktree(m.repoPath, m.deleteTarget.Path); err != nil {
-						m.err = err
-					} else {
-						m.statusMessage = fmt.Sprintf("Deleted worktree: %s", m.deleteTarget.Branch)
-						m.statusTimeout = time.Now().Add(3 * time.Second)
-						// Refresh worktrees
-						if worktrees, err := getWorktrees(m.repoPath); err == nil {
-							m.worktrees = worktrees
-							m.filtered = filterWorktrees(worktrees, m.searchTerm)
-						}
-					}
-				}
-				m.confirmDelete = false
-				m.deleteTarget = nil
-				return m, tickCmd()
-			case "n", "N", "esc", "ctrl+c":
-				m.confirmDelete = false
-				m.deleteTarget = nil
-				return m, nil
-			}
-			return m, nil
+		// Clear any previous operational error on keypress
+		m.err = nil
+
+		if m.del.confirming {
+			return m.handleDeleteConfirm(msg)
 		}
 
-		switch m.inputMode {
+		switch m.ui.inputMode {
 		case modeSearch:
-			switch msg.String() {
-			case "esc", "ctrl+c":
-				m.inputMode = modeNormal
-				m.searchTerm = ""
-				m.filtered = m.worktrees
-				return m, nil
-			case "enter":
-				m.inputMode = modeNormal
-				return m, nil
-			case "backspace":
-				if len(m.searchTerm) > 0 {
-					m.searchTerm = m.searchTerm[:len(m.searchTerm)-1]
-					m.filtered = filterWorktrees(m.worktrees, m.searchTerm)
-				}
-				return m, nil
-			default:
-				if len(msg.String()) == 1 {
-					m.searchTerm += msg.String()
-					m.filtered = filterWorktrees(m.worktrees, m.searchTerm)
-				}
-				return m, nil
-			}
-
+			return m.handleSearchMode(msg)
 		case modeNewBranch:
-			switch msg.String() {
-			case "esc", "ctrl+c":
-				m.inputMode = modeNormal
-				m.inputValue = ""
-				return m, nil
-			case "enter":
-				if m.inputValue != "" {
-					if err := createWorktree(m.repoPath, m.inputValue, m.config); err != nil {
-						m.err = err
-					} else {
-						m.statusMessage = fmt.Sprintf("Created worktree: %s", m.inputValue)
-						m.statusTimeout = time.Now().Add(3 * time.Second)
-						// Refresh worktrees
-						if worktrees, err := getWorktrees(m.repoPath); err == nil {
-							m.worktrees = worktrees
-							m.filtered = filterWorktrees(worktrees, m.searchTerm)
-						}
-					}
-				}
-				m.inputMode = modeNormal
-				m.inputValue = ""
-				return m, tickCmd()
-			case "backspace":
-				if len(m.inputValue) > 0 {
-					m.inputValue = m.inputValue[:len(m.inputValue)-1]
-				}
-				return m, nil
-			default:
-				if len(msg.String()) == 1 || msg.String() == "/" || msg.String() == "-" {
-					m.inputValue += msg.String()
-				}
-				return m, nil
-			}
-
-		default: // modeNormal
-			switch msg.String() {
-			case "q", "ctrl+c":
-				m.quitting = true
-				return m, tea.Quit
-
-			case "up", "k":
-				if m.cursor > 0 {
-					m.cursor--
-				}
-				return m, nil
-
-			case "down", "j":
-				if m.cursor < len(m.filtered)-1 {
-					m.cursor++
-				}
-				return m, nil
-
-			case "/":
-				m.inputMode = modeSearch
-				m.searchTerm = ""
-				return m, nil
-
-			case "n":
-				m.inputMode = modeNewBranch
-				m.inputValue = ""
-				return m, nil
-
-			case "d":
-				if m.cursor < len(m.filtered) {
-					wt := &m.filtered[m.cursor]
-					if strings.HasSuffix(m.repoPath, wt.Path) {
-						m.err = fmt.Errorf("cannot delete main worktree")
-						return m, nil
-					}
-					m.confirmDelete = true
-					m.deleteTarget = wt
-				}
-				return m, nil
-
-			case "r":
-				// Refresh worktrees
-				if worktrees, err := getWorktrees(m.repoPath); err == nil {
-					m.worktrees = worktrees
-					m.filtered = filterWorktrees(worktrees, m.searchTerm)
-					m.statusMessage = "Refreshed"
-					m.statusTimeout = time.Now().Add(2 * time.Second)
-				}
-				return m, tickCmd()
-
-			case "enter":
-				if m.cursor < len(m.filtered) {
-					wt := m.filtered[m.cursor]
-					// Exit the TUI and switch to the worktree
-					m.quitting = true
-					fmt.Printf("\n\033[2mSwitching to %s...\033[0m\n", wt.Path)
-					
-					// Change to the worktree directory
-					if err := os.Chdir(wt.Path); err != nil {
-						m.err = err
-						return m, nil
-					}
-					
-					// Start a new shell in the worktree directory
-					shell := getShell(m.config)
-					cmd := exec.Command(shell)
-					cmd.Stdin = os.Stdin
-					cmd.Stdout = os.Stdout
-					cmd.Stderr = os.Stderr
-					cmd.Dir = wt.Path
-					
-					// Execute the shell after quitting the TUI
-					return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
-						if err != nil {
-							return err
-						}
-						return tea.Quit()
-					})
-				}
-				return m, nil
-			}
+			return m.handleNewBranchMode(msg)
+		case modeActions:
+			return m.handleActionsMode(msg)
+		default:
+			return m.handleNormalMode(msg)
 		}
 	}
 
@@ -700,47 +1118,59 @@ func (m model) View() string {
 	s.WriteString(titleStyle.Render(title) + "\n")
 
 	// Search or input
-	switch m.inputMode {
+	switch m.ui.inputMode {
 	case modeSearch:
-		s.WriteString(searchStyle.Render("Search: ") + m.searchTerm + "█\n\n")
+		s.WriteString(searchStyle.Render("Search: ") + m.wt.searchTerm + "█\n\n")
 	case modeNewBranch:
-		s.WriteString(searchStyle.Render("New branch name: ") + m.inputValue + "█\n\n")
+		s.WriteString(searchStyle.Render("New branch name: ") + m.ui.inputValue + "█\n\n")
+	case modeActions:
+		if m.ui.cursor < len(m.wt.filtered) {
+			wt := m.wt.filtered[m.ui.cursor]
+			s.WriteString(searchStyle.Render(fmt.Sprintf("Actions for %s:\n", wt.Branch)))
+			for i, action := range m.acts.actions {
+				cursor := "  "
+				if i == m.acts.cursor {
+					cursor = "▸ "
+				}
+				line := fmt.Sprintf("%s[%s] %s", cursor, action.key, action.label)
+				if i == m.acts.cursor {
+					s.WriteString(selectedStyle.Render(line) + "\n")
+				} else {
+					s.WriteString(line + "\n")
+				}
+			}
+			s.WriteString(helpStyle.Render("\n[enter] select  [esc] cancel\n"))
+		}
+		return s.String()
 	default:
-		if m.searchTerm != "" {
-			s.WriteString(searchStyle.Render("Search: ") + dimStyle.Render(m.searchTerm) + "\n\n")
+		if m.wt.searchTerm != "" {
+			s.WriteString(searchStyle.Render("Search: ") + dimStyle.Render(m.wt.searchTerm) + "\n\n")
 		} else {
 			s.WriteString("\n")
 		}
 	}
 
 	// Confirmation dialog
-	if m.confirmDelete && m.deleteTarget != nil {
-		s.WriteString(errorStyle.Render(fmt.Sprintf("\nDelete worktree '%s'? [y/N] ", m.deleteTarget.Branch)))
+	if m.del.confirming && m.del.target != nil {
+		s.WriteString(errorStyle.Render(fmt.Sprintf("\nDelete worktree '%s'? [y/N] ", m.del.target.Branch)))
 		return s.String()
 	}
 
 	// Worktree list
-	if len(m.filtered) == 0 {
+	if len(m.wt.filtered) == 0 {
 		s.WriteString(dimStyle.Render("  No worktrees found\n"))
 	} else {
-		viewportHeight := m.height - 8 // Account for header and footer
-		if viewportHeight < 5 {
-			viewportHeight = 5
+		viewportHeight := m.ui.height - viewportPadding
+		if viewportHeight < minViewportHeight {
+			viewportHeight = minViewportHeight
 		}
 
-		// Adjust scroll offset
-		if m.cursor >= m.scrollOffset+viewportHeight {
-			m.scrollOffset = m.cursor - viewportHeight + 1
-		} else if m.cursor < m.scrollOffset {
-			m.scrollOffset = m.cursor
-		}
+		for i := m.ui.scrollOffset; i < len(m.wt.filtered) && i < m.ui.scrollOffset+viewportHeight; i++ {
+			wt := m.wt.filtered[i]
 
-		for i := m.scrollOffset; i < len(m.filtered) && i < m.scrollOffset+viewportHeight; i++ {
-			wt := m.filtered[i]
-			
 			// Cursor indicator
 			cursor := "  "
-			if i == m.cursor {
+			if i == m.ui.cursor {
 				cursor = "▸ "
 			}
 
@@ -761,23 +1191,34 @@ func (m model) View() string {
 				status = dirtyStyle.Render("●")
 			}
 
-			// Commit info
-			commitMsg := wt.LastCommit.Message
-			if len(commitMsg) > 40 {
-				commitMsg = commitMsg[:40] + "..."
+			// Ahead/behind indicator
+			var aheadBehind string
+			if wt.Ahead > 0 || wt.Behind > 0 {
+				var parts []string
+				if wt.Ahead > 0 {
+					parts = append(parts, aheadStyle.Render(fmt.Sprintf("↑%d", wt.Ahead)))
+				}
+				if wt.Behind > 0 {
+					parts = append(parts, behindStyle.Render(fmt.Sprintf("↓%d", wt.Behind)))
+				}
+				aheadBehind = " " + strings.Join(parts, " ")
 			}
-			
+
+			// Commit info
+			commitMsg := truncateString(wt.LastCommit.Message, maxCommitMsgLength)
 			relTime := formatRelativeTime(wt.LastCommit.Date)
 
 			// Format line
-			line := fmt.Sprintf("%s%-20s %s  %s",
+			line := fmt.Sprintf("%s%-*s %s%s  %s",
 				cursor,
+				branchDisplayWidth,
 				branch,
 				status,
+				aheadBehind,
 				dimStyle.Render(fmt.Sprintf("%s (%s)", commitMsg, relTime)),
 			)
 
-			if i == m.cursor {
+			if i == m.ui.cursor {
 				s.WriteString(selectedStyle.Render(line) + "\n")
 			} else {
 				s.WriteString(line + "\n")
@@ -785,15 +1226,20 @@ func (m model) View() string {
 		}
 	}
 
+	// Error message (operational errors, not fatal)
+	if m.err != nil {
+		s.WriteString("\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err)) + "\n")
+	}
+
 	// Status message
-	if m.statusMessage != "" {
-		s.WriteString("\n" + successStyle.Render(m.statusMessage) + "\n")
+	if m.status.message != "" {
+		s.WriteString("\n" + successStyle.Render(m.status.message) + "\n")
 	}
 
 	// Help
 	s.WriteString("\n")
-	if m.inputMode == modeNormal {
-		help := "[n]ew  [d]elete  [enter] switch  [/] search  [r]efresh  [q]uit"
+	if m.ui.inputMode == modeNormal {
+		help := "[n]ew  [d]elete  [a]ctions  [enter] switch  [/] search  [r]efresh  [^] default  [-] prev  [@] current  [q]uit"
 		s.WriteString(helpStyle.Render(help))
 	} else {
 		help := "[enter] confirm  [esc] cancel"
@@ -803,6 +1249,99 @@ func (m model) View() string {
 	return s.String()
 }
 
+func generateBashCompletion() string {
+	return `_gt_completions() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    # Get list of branches for completion
+    if [[ "$prev" == "gt" ]] || [[ "$prev" == "-x" ]] || [[ "$prev" == "--execute" ]]; then
+        local branches=$(git branch --format='%(refname:short)' 2>/dev/null)
+        local worktrees=$(git worktree list --porcelain 2>/dev/null | grep "^branch" | sed 's/branch refs\/heads\///')
+        COMPREPLY=($(compgen -W "$branches $worktrees -h --help -v --version -x --execute" -- "$cur"))
+    elif [[ "$cur" == -* ]]; then
+        COMPREPLY=($(compgen -W "-h --help -v --version -x --execute" -- "$cur"))
+    else
+        local branches=$(git branch --format='%(refname:short)' 2>/dev/null)
+        COMPREPLY=($(compgen -W "$branches" -- "$cur"))
+    fi
+}
+
+complete -F _gt_completions gt
+`
+}
+
+func generateZshCompletion() string {
+	return `#compdef gt
+
+_gt() {
+    local -a branches worktrees
+
+    # Get branches
+    branches=(${(f)"$(git branch --format='%(refname:short)' 2>/dev/null)"})
+
+    # Get worktree branches
+    worktrees=(${(f)"$(git worktree list --porcelain 2>/dev/null | grep '^branch' | sed 's/branch refs\/heads\///')"})
+
+    _arguments \
+        '(-h --help)'{-h,--help}'[Show help message]' \
+        '(-v --version)'{-v,--version}'[Show version]' \
+        '(-x --execute)'{-x,--execute}'[Execute command after switch]:command:_command_names' \
+        '1:worktree name:->worktree' \
+        '2:source branch:->branch'
+
+    case $state in
+        worktree|branch)
+            _describe -t branches 'branches' branches
+            _describe -t worktrees 'worktrees' worktrees
+            ;;
+    esac
+}
+
+_gt "$@"
+`
+}
+
+func generateFishCompletion() string {
+	return `# Fish completion for gt
+
+function __gt_branches
+    git branch --format='%(refname:short)' 2>/dev/null
+end
+
+function __gt_worktrees
+    git worktree list --porcelain 2>/dev/null | string match -r '^branch refs/heads/(.*)' | string replace 'branch refs/heads/' ''
+end
+
+# Disable file completion
+complete -c gt -f
+
+# Options
+complete -c gt -s h -l help -d 'Show help message'
+complete -c gt -s v -l version -d 'Show version'
+complete -c gt -s x -l execute -d 'Execute command after switch' -r
+
+# Subcommands
+complete -c gt -n '__fish_is_first_arg' -a '(__gt_branches)' -d 'Branch'
+complete -c gt -n '__fish_is_first_arg' -a '(__gt_worktrees)' -d 'Worktree'
+complete -c gt -n 'not __fish_is_first_arg' -a '(__gt_branches)' -d 'Source branch'
+`
+}
+
+func printCompletion(shell string) {
+	switch shell {
+	case "bash":
+		fmt.Print(generateBashCompletion())
+	case "zsh":
+		fmt.Print(generateZshCompletion())
+	case "fish":
+		fmt.Print(generateFishCompletion())
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown shell: %s\nSupported shells: bash, zsh, fish\n", shell)
+		os.Exit(1)
+	}
+}
+
 func printHelp() {
 	help := fmt.Sprintf(`gt - Git Worktree Manager v%s
 
@@ -810,28 +1349,76 @@ USAGE:
     gt                           Open interactive worktree manager
     gt <name>                    Create worktree from current branch and switch to it
     gt <name> <branch>           Create worktree from specified branch and switch to it
+    gt <name> -x <cmd>           Create worktree and execute command instead of shell
+    gt completion <shell>        Generate shell completion script (bash, zsh, fish)
     gt -h, --help                Show this help message
     gt -v, --version             Show version information
+
+OPTIONS:
+    -x, --execute <cmd>          Execute command after switching (instead of shell)
 
 EXAMPLES:
     gt                           # Open TUI to manage worktrees
     gt feature-xyz               # Create worktree 'feature-xyz' from current branch
     gt fix-bug main              # Create worktree 'fix-bug' from 'main' branch
+    gt feature-xyz -x "code ."   # Create worktree and open in VS Code
+    gt feature-xyz -x claude     # Create worktree and start Claude Code
+
+SHELL COMPLETION:
+    # Bash: Add to ~/.bashrc
+    eval "$(gt completion bash)"
+
+    # Zsh: Add to ~/.zshrc
+    eval "$(gt completion zsh)"
+
+    # Fish: Add to ~/.config/fish/config.fish
+    gt completion fish | source
 
 INTERACTIVE MODE COMMANDS:
     n        Create new worktree
     d        Delete selected worktree
+    a        Open actions menu for selected worktree
     enter    Switch to selected worktree
     /        Search worktrees
     r        Refresh list
+    ^        Jump to default branch worktree
+    -        Jump to previous worktree
+    @        Jump to current worktree
     q        Quit
+
+QUICK ACTIONS (from actions menu):
+    e        Open in editor ($EDITOR)
+    c        Open in VS Code
+    t        Open terminal here
+    f        Open in Finder
+    p        Copy path to clipboard
 
 CONFIGURATION:
     Config file: ~/.config/gt/config.json
-    
+
     Options:
     - worktree_dir: Directory for worktrees (default: .worktrees)
+                    Use absolute path to place worktrees outside repo
+                    Use "../" prefix to place worktrees as siblings
     - shell: Shell to use when switching (default: $SHELL or /bin/bash)
+    - post_create: Command to run after creating a worktree (e.g., "npm install")
+
+    Example configs:
+
+    # Default (inside repo):
+    { "worktree_dir": ".worktrees" }
+
+    # Sibling directories (like worktrunk):
+    { "worktree_dir": "../gt-worktrees" }
+
+    # Absolute path:
+    { "worktree_dir": "/Users/me/worktrees/gt" }
+
+    # With post-create hook:
+    {
+      "worktree_dir": "../gt-worktrees",
+      "post_create": "npm install"
+    }
 `, version)
 	fmt.Print(help)
 }
@@ -846,14 +1433,68 @@ func getCurrentBranch(repoPath string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func switchToWorktree(worktreePath string, config *Config) error {
+func getDefaultBranch(repoPath string) string {
+	// Try to get the default branch from remote
+	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd.Dir = repoPath
+	output, err := cmd.Output()
+	if err == nil {
+		ref := strings.TrimSpace(string(output))
+		// refs/remotes/origin/main -> main
+		parts := strings.Split(ref, "/")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
+	}
+
+	// Fallback: check common default branch names
+	for _, branch := range []string{"main", "master"} {
+		cmd = exec.Command("git", "rev-parse", "--verify", branch)
+		cmd.Dir = repoPath
+		if err := cmd.Run(); err == nil {
+			return branch
+		}
+	}
+
+	return "main"
+}
+
+func runPostCreateHook(worktreePath string, config *Config) error {
+	if config == nil || config.PostCreate == "" {
+		return nil
+	}
+
+	fmt.Printf("\033[2mRunning post-create hook: %s\033[0m\n", config.PostCreate)
+
+	shell := getShell(config)
+	cmd := exec.Command(shell, "-c", config.PostCreate)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = worktreePath
+
+	return cmd.Run()
+}
+
+func switchToWorktree(worktreePath string, config *Config, executeCmd string) error {
 	// Change to the worktree directory
 	if err := os.Chdir(worktreePath); err != nil {
 		return err
 	}
-	
+
 	fmt.Printf("\033[2mSwitched to %s\033[0m\n", worktreePath)
-	
+
+	// If an execute command is specified, run it instead of starting a shell
+	if executeCmd != "" {
+		shell := getShell(config)
+		cmd := exec.Command(shell, "-c", executeCmd)
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Dir = worktreePath
+		return cmd.Run()
+	}
+
 	// Start a new shell in the worktree directory
 	shell := getShell(config)
 	cmd := exec.Command(shell)
@@ -861,84 +1502,136 @@ func switchToWorktree(worktreePath string, config *Config) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Dir = worktreePath
-	
+
 	return cmd.Run()
 }
 
-func main() {
-	// Parse command-line arguments
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "-h", "--help", "help":
-			printHelp()
-			os.Exit(0)
-		case "-v", "--version", "version":
-			fmt.Printf("gt version %s\n", version)
-			os.Exit(0)
-		default:
-			// Handle worktree creation
-			worktreeName := os.Args[1]
-			var sourceBranch string
-			
-			// Get repo path
-			repoPath, err := getCurrentRepoPath()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-			
-			// Load config
-			config, _ := loadConfig()
-			if config == nil {
-				config = &Config{}
-			}
-			
-			// Determine source branch
-			if len(os.Args) > 2 {
-				sourceBranch = os.Args[2]
+func parseArgs() (worktreeName, sourceBranch, executeCmd, completionShell string, showHelp, showVersion bool) {
+	args := os.Args[1:]
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-h" || arg == "--help" || arg == "help":
+			showHelp = true
+			return
+		case arg == "-v" || arg == "--version" || arg == "version":
+			showVersion = true
+			return
+		case arg == "completion":
+			if i+1 < len(args) {
+				i++
+				completionShell = args[i]
 			} else {
-				// Use current branch
-				sourceBranch, err = getCurrentBranch(repoPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
-					os.Exit(1)
-				}
+				completionShell = "bash"
 			}
-			
-			// Create the worktree
-			fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
-			
-			// First check if we need to create from an existing branch or create new
-			if sourceBranch != worktreeName {
-				// Create worktree from existing branch
-				err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
-			} else {
-				// Create new branch with worktree
-				err = createWorktree(repoPath, worktreeName, config)
+			return
+		case arg == "-x" || arg == "--execute":
+			if i+1 < len(args) {
+				i++
+				executeCmd = args[i]
 			}
-			
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating worktree: %v\n", err)
-				os.Exit(1)
-			}
-			
-			// Determine worktree path
-			worktreeDir := defaultWorktreeDir
-			if config != nil && config.WorktreeDir != "" {
-				worktreeDir = config.WorktreeDir
-			}
-			if !filepath.IsAbs(worktreeDir) {
-				worktreeDir = filepath.Join(repoPath, worktreeDir)
-			}
-			worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
-			
-			// Switch to the new worktree
-			if err := switchToWorktree(worktreePath, config); err != nil {
-				fmt.Fprintf(os.Stderr, "Error switching to worktree: %v\n", err)
-				os.Exit(1)
-			}
-			os.Exit(0)
+		case strings.HasPrefix(arg, "-x="):
+			executeCmd = strings.TrimPrefix(arg, "-x=")
+		case strings.HasPrefix(arg, "--execute="):
+			executeCmd = strings.TrimPrefix(arg, "--execute=")
+		case !strings.HasPrefix(arg, "-"):
+			positional = append(positional, arg)
 		}
+	}
+
+	if len(positional) > 0 {
+		worktreeName = positional[0]
+	}
+	if len(positional) > 1 {
+		sourceBranch = positional[1]
+	}
+
+	return
+}
+
+func main() {
+	worktreeName, sourceBranch, executeCmd, completionShell, showHelp, showVersion := parseArgs()
+
+	if showHelp {
+		printHelp()
+		os.Exit(0)
+	}
+
+	if showVersion {
+		fmt.Printf("gt version %s\n", version)
+		os.Exit(0)
+	}
+
+	if completionShell != "" {
+		printCompletion(completionShell)
+		os.Exit(0)
+	}
+
+	// Handle worktree creation if name provided
+	if worktreeName != "" {
+		// Get repo path
+		repoPath, err := getCurrentRepoPath()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Load config
+		config, _ := loadConfig()
+		if config == nil {
+			config = &Config{}
+		}
+
+		// Determine source branch
+		if sourceBranch == "" {
+			// Use current branch
+			sourceBranch, err = getCurrentBranch(repoPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error getting current branch: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Create the worktree
+		fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
+
+		// First check if we need to create from an existing branch or create new
+		if sourceBranch != worktreeName {
+			// Create worktree from existing branch
+			err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
+		} else {
+			// Create new branch with worktree
+			err = createWorktree(repoPath, worktreeName, config)
+		}
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating worktree: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Determine worktree path
+		worktreeDir := defaultWorktreeDir
+		if config != nil && config.WorktreeDir != "" {
+			worktreeDir = config.WorktreeDir
+		}
+		if !filepath.IsAbs(worktreeDir) {
+			worktreeDir = filepath.Join(repoPath, worktreeDir)
+		}
+		worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
+
+		// Run post-create hook if configured
+		if err := runPostCreateHook(worktreePath, config); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: post-create hook failed: %v\n", err)
+		}
+
+		// Switch to the new worktree
+		if err := switchToWorktree(worktreePath, config, executeCmd); err != nil {
+			fmt.Fprintf(os.Stderr, "Error switching to worktree: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
 	}
 	
 	// No arguments - run interactive mode
