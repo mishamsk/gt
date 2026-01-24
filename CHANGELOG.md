@@ -7,7 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-01-24
+
 ### Fixed
+- Fix TUI hanging on startup and refresh when fetching worktree details
 - Honor `XDG_CONFIG_HOME` for config lookup before platform defaults
 
 ## [0.4.0] - 2026-01-22
