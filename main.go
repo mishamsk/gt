@@ -159,15 +159,16 @@ type mergeState struct {
 
 // model is the Bubble Tea model for the TUI application.
 type model struct {
-	ui       uiState
-	wt       worktreeState
-	acts     actionsState
-	del      deleteState
-	merge    mergeState
-	repoPath string
-	config   *Config
-	err      error
-	status   struct {
+	ui              uiState
+	wt              worktreeState
+	acts            actionsState
+	del             deleteState
+	merge           mergeState
+	repoPath        string
+	mainWorktreeDir string
+	config          *Config
+	err             error
+	status          struct {
 		message string
 		isError bool
 		timeout time.Time
@@ -274,6 +275,42 @@ func truncateString(s string, maxLen int) string {
 	}
 	runes := []rune(s)
 	return string(runes[:maxLen]) + ellipsis
+}
+
+// truncateToWidth truncates a string to fit within maxWidth display columns,
+// adding an ellipsis suffix if truncation is needed.
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	ellipsisWidth := lipgloss.Width(ellipsis)
+	if maxWidth <= ellipsisWidth {
+		return ellipsis[:maxWidth]
+	}
+	runes := []rune(s)
+	width := 0
+	for i, r := range runes {
+		rw := lipgloss.Width(string(r))
+		if width+rw > maxWidth-ellipsisWidth {
+			return string(runes[:i]) + ellipsis
+		}
+		width += rw
+	}
+	return s
+}
+
+// isExpectedWorktreePath checks whether the worktree folder name matches
+// the convention for the given branch (slashes replaced with dashes).
+func isExpectedWorktreePath(branch, worktreePath string) bool {
+	if branch == "" || worktreePath == "" {
+		return true
+	}
+	expectedName := strings.ReplaceAll(branch, "/", "-")
+	actualName := filepath.Base(filepath.Clean(worktreePath))
+	return actualName == expectedName
 }
 
 func getConfigPath() string {
@@ -714,9 +751,10 @@ func tickCmd() tea.Cmd {
 
 // worktreesLoadedMsg is sent when async worktree loading completes.
 type worktreesLoadedMsg struct {
-	worktrees     []Worktree
-	defaultBranch string
-	err           error
+	worktrees       []Worktree
+	defaultBranch   string
+	mainWorktreeDir string
+	err             error
 }
 
 // worktreeDetailLoadedMsg reports incremental detail updates for a single worktree.
@@ -763,10 +801,15 @@ func loadWorktreesCmd(repoPath string) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCmdSlowTimeout)
 		defer cancel()
 		worktrees, defaultBranch, err := listWorktreesWithContext(ctx, repoPath)
+		var mainDir string
+		if len(worktrees) > 0 {
+			mainDir = worktrees[0].Path
+		}
 		return worktreesLoadedMsg{
-			worktrees:     worktrees,
-			defaultBranch: defaultBranch,
-			err:           err,
+			worktrees:       worktrees,
+			defaultBranch:   defaultBranch,
+			mainWorktreeDir: mainDir,
+			err:             err,
 		}
 	}
 }
@@ -1216,6 +1259,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.wt.worktrees = msg.worktrees
 		m.wt.filtered = filterWorktrees(msg.worktrees, m.wt.searchTerm)
 		m.wt.defaultBranch = msg.defaultBranch
+		m.mainWorktreeDir = msg.mainWorktreeDir
 		m.wt.detailGeneration++
 		m.resetDetailQueue()
 		// Find current worktree path for tracking previous (session-only)
@@ -1781,6 +1825,14 @@ func (m model) View() string {
 				branch = branchStyle.Render(branch)
 			}
 
+			// Folder mismatch — shown when folder name doesn't match branch
+			isMainWorktree := filepath.Clean(wt.Path) == filepath.Clean(m.mainWorktreeDir)
+			hasFolderMismatch := !isMainWorktree && !isExpectedWorktreePath(wt.Branch, wt.Path)
+			folderName := ""
+			if hasFolderMismatch {
+				folderName = filepath.Base(filepath.Clean(wt.Path))
+			}
+
 			// Status indicator
 			status := "✓"
 			if wt.IsDirty {
@@ -1803,15 +1855,49 @@ func (m model) View() string {
 			// Commit info
 			commitMsg := truncateString(wt.LastCommit.Message, maxCommitMsgLength)
 			relTime := formatRelativeTime(wt.LastCommit.Date)
+			commitText := fmt.Sprintf("%s (%s)", commitMsg, relTime)
 
-			// Format line
-			line := fmt.Sprintf("%s%-*s %s%s  %s",
+			// Build folder label: "[📂 name]" if it fits, just "[📂]" if tight
+			folderLabel := ""
+			if hasFolderMismatch {
+				tail := fmt.Sprintf(" │ %s%s  ", status, aheadBehind)
+				basePrefix := fmt.Sprintf("%s%-*s", cursor, branchDisplayWidth, branch)
+				basePrefixWidth := lipgloss.Width(basePrefix) + lipgloss.Width(tail)
+
+				fullLabel := " " + dimStyle.Render("[📂 "+folderName+"]")
+				commitWidth := lipgloss.Width(commitText)
+				if m.ui.width <= 0 || basePrefixWidth+lipgloss.Width(fullLabel)+commitWidth <= m.ui.width {
+					folderLabel = fullLabel
+				} else {
+					folderLabel = " " + dimStyle.Render("[📂]")
+				}
+			}
+
+			// Format line: cursor branch [📂 name] │ status ahead/behind  commit
+			var separator string
+			if hasFolderMismatch {
+				separator = " │ "
+			} else {
+				separator = " "
+			}
+			prefix := fmt.Sprintf("%s%-*s%s%s%s%s ",
 				cursor,
 				branchDisplayWidth,
 				branch,
+				folderLabel,
+				separator,
 				status,
 				aheadBehind,
-				dimStyle.Render(fmt.Sprintf("%s (%s)", commitMsg, relTime)),
+			)
+			maxDetailWidth := 0
+			if m.ui.width > 0 {
+				maxDetailWidth = m.ui.width - lipgloss.Width(prefix)
+			}
+			detailText := truncateToWidth(commitText, maxDetailWidth)
+
+			line := fmt.Sprintf("%s%s",
+				prefix,
+				dimStyle.Render(detailText),
 			)
 
 			if i == m.ui.cursor {

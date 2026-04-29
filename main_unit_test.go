@@ -127,6 +127,53 @@ func TestTruncateString(t *testing.T) {
 	}
 }
 
+func TestIsExpectedWorktreePath(t *testing.T) {
+	tests := []struct {
+		name         string
+		branch       string
+		worktreePath string
+		want         bool
+	}{
+		{"matching simple branch", "add-orm", "/repo/.worktrees/add-orm", true},
+		{"matching branch with slash", "feature/login", "/repo/.worktrees/feature-login", true},
+		{"non-matching folder", "add-orm", "/repo/.worktrees/custom-name", false},
+		{"empty branch", "", "/repo/.worktrees/whatever", true},
+		{"empty path", "main", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isExpectedWorktreePath(tt.branch, tt.worktreePath)
+			if got != tt.want {
+				t.Errorf("isExpectedWorktreePath(%q, %q) = %v, want %v", tt.branch, tt.worktreePath, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTruncateToWidth(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		maxWidth int
+		want     string
+	}{
+		{"fits within width", "hello", 10, "hello"},
+		{"truncates with ellipsis", "Fix crash (2h ago)", 12, "Fix crash..."},
+		{"zero width", "hello", 0, ""},
+		{"very small width", "hello world", 3, "..."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := truncateToWidth(tt.input, tt.maxWidth)
+			if got != tt.want {
+				t.Errorf("truncateToWidth(%q, %d) = %q, want %q", tt.input, tt.maxWidth, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFormatRelativeTime(t *testing.T) {
 	now := time.Now()
 
