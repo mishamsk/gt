@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-04-30
+
+### Added
+- Show worktree subpath indicator (`[📂 folder-name]`) in TUI when a worktree's folder name doesn't match its branch name; collapses to `[📂]` on narrow terminals
+
 ## [0.4.1] - 2026-01-24
 
 ### Fixed
