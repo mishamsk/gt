@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-03
+
+### Added
+- `gt <branch>` now follows `git switch`'s remote-branch guess behavior: if no local branch matches, gt creates a tracking branch from a matching remote-tracking ref, or from a branch discovered on exactly one remote (fetching it if needed). `checkout.defaultRemote` disambiguates when the branch exists on multiple remotes.
+
+### Fixed
+- Remote-branch worktree creation now works in single-branch and restricted-refspec clones, where git's `--track` would previously refuse to attach to a ref outside the configured fetch refspec.
+
 ## [0.4.2] - 2026-04-30
 
 ### Added
