@@ -39,6 +39,72 @@ func TestEnsureNoTrackedFilesPassesForEmptyDir(t *testing.T) {
 	}
 }
 
+func TestEnsureWorktreeDirRejectsRepositoryRoot(t *testing.T) {
+	repoPath := initRepo(t)
+
+	_, err := ensureWorktreeDir(repoPath, &Config{WorktreeDir: "."})
+	if err == nil {
+		t.Fatal("expected repository-root worktree directory to be rejected")
+	}
+}
+
+func TestResolveWorktreeDirFallsBackForSeparateGitDir(t *testing.T) {
+	parentDir := t.TempDir()
+	repoPath := filepath.Join(parentDir, "checkout")
+	gitDir := filepath.Join(parentDir, "metadata", ".git")
+	if err := os.MkdirAll(filepath.Dir(gitDir), 0755); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+
+	runGit(t, parentDir, "init", "--separate-git-dir="+gitDir, "--initial-branch=master", repoPath)
+	readmePath := filepath.Join(repoPath, "README.md")
+	if err := os.WriteFile(readmePath, []byte("test"), 0644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runGit(t, repoPath, "add", "README.md")
+	runGit(t, repoPath, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+
+	worktreeDir, baseRepoPath := resolveWorktreeDir(repoPath, &Config{WorktreeDir: ".worktrees"})
+	if baseRepoPath != repoPath {
+		t.Errorf("base repository path = %q, want %q", baseRepoPath, repoPath)
+	}
+	wantWorktreeDir := filepath.Join(repoPath, ".worktrees")
+	if worktreeDir != wantWorktreeDir {
+		t.Errorf("worktree directory = %q, want %q", worktreeDir, wantWorktreeDir)
+	}
+}
+
+func TestResolveWorktreeDirFallsBackFromLinkedWorktreeWithSeparateGitDir(t *testing.T) {
+	parentDir := t.TempDir()
+	checkoutPath := filepath.Join(parentDir, "checkout")
+	gitDir := filepath.Join(parentDir, "metadata", ".git")
+	linkedWorktreePath := filepath.Join(parentDir, "linked")
+	if err := os.MkdirAll(filepath.Dir(gitDir), 0755); err != nil {
+		t.Fatalf("create metadata directory: %v", err)
+	}
+
+	runGit(t, parentDir, "init", "--separate-git-dir="+gitDir, "--initial-branch=master", checkoutPath)
+	runGit(t, checkoutPath, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+		"commit", "--allow-empty", "-m", "init")
+	runGit(t, checkoutPath, "worktree", "add", "-b", "source", linkedWorktreePath)
+
+	worktreePath, err := createWorktree(linkedWorktreePath, "feature", &Config{})
+	if err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	wantWorktreePath := filepath.Join(linkedWorktreePath, defaultWorktreeDir, "feature")
+	if worktreePath != wantWorktreePath {
+		t.Errorf("worktree path = %q, want %q", worktreePath, wantWorktreePath)
+	}
+	if _, err := os.Stat(wantWorktreePath); err != nil {
+		t.Fatalf("expected linked-worktree-relative path to exist: %v", err)
+	}
+	metadataWorktreePath := filepath.Join(filepath.Dir(gitDir), defaultWorktreeDir, "feature")
+	if _, err := os.Stat(metadataWorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("did not expect worktree under metadata directory: %v", err)
+	}
+}
+
 func TestGetAheadBehindWithContext(t *testing.T) {
 	repoPath := initRepo(t)
 	ctx := context.Background()

@@ -369,6 +369,95 @@ func getCurrentRepoPath() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+func getMainWorktreePath(repoPath string) (string, bool) {
+	output, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "worktree", "list", "--porcelain")
+	if err != nil {
+		return "", false
+	}
+
+	var mainWorktreePath string
+	for _, line := range strings.Split(string(output), "\n") {
+		if path, found := strings.CutPrefix(line, "worktree "); found {
+			mainWorktreePath = filepath.Clean(path)
+			break
+		}
+	}
+	if mainWorktreePath == "" {
+		return "", false
+	}
+
+	// Only recognize the conventional layout: a non-empty checkout with its
+	// Git directory at <worktree>/.git. Ambiguous layouts fall back to the
+	// current Git top-level.
+	if info, err := os.Stat(filepath.Join(mainWorktreePath, ".git")); err != nil || !info.IsDir() {
+		return "", false
+	}
+	entries, err := os.ReadDir(mainWorktreePath)
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if entry.Name() != ".git" {
+			return mainWorktreePath, true
+		}
+	}
+	return "", false
+}
+
+func configuredWorktreeDir(config *Config) string {
+	if config != nil && config.WorktreeDir != "" {
+		return config.WorktreeDir
+	}
+	return defaultWorktreeDir
+}
+
+func resolveWorktreeDir(repoPath string, config *Config) (worktreeDir, baseRepoPath string) {
+	worktreeDir = configuredWorktreeDir(config)
+	if filepath.IsAbs(worktreeDir) {
+		return filepath.Clean(worktreeDir), repoPath
+	}
+
+	baseRepoPath = repoPath
+	if mainWorktreePath, ok := getMainWorktreePath(repoPath); ok {
+		baseRepoPath = mainWorktreePath
+	}
+	return filepath.Join(baseRepoPath, worktreeDir), baseRepoPath
+}
+
+func relPathWithin(basePath, targetPath string) (string, bool) {
+	relPath, err := filepath.Rel(basePath, targetPath)
+	if err != nil || relPath == "" || relPath == "." || filepath.IsAbs(relPath) {
+		return "", false
+	}
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return relPath, true
+}
+
+func ensureWorktreeDir(repoPath string, config *Config) (string, error) {
+	worktreeDir, baseRepoPath := resolveWorktreeDir(repoPath, config)
+	if filepath.Clean(worktreeDir) == filepath.Clean(baseRepoPath) {
+		return "", fmt.Errorf("worktree directory must not be the repository root")
+	}
+
+	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
+		return "", err
+	}
+
+	if relPath, ok := relPathWithin(baseRepoPath, worktreeDir); ok {
+		if err := ensureNoTrackedFiles(baseRepoPath, relPath); err != nil {
+			return "", err
+		}
+		if err := ensureGitExcludeEntry(baseRepoPath, relPath); err != nil {
+			// Don't fail the worktree creation if we can't update git excludes.
+			fmt.Fprintf(os.Stderr, "Warning: Could not update git excludes: %v\n", err)
+		}
+	}
+
+	return worktreeDir, nil
+}
+
 // runGitCmd executes a git command with context support for cancellation.
 func runGitCmd(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -787,7 +876,7 @@ func createWorktreeCmd(repoPath, branch string, config *Config) tea.Cmd {
 		cfg = &copy
 	}
 	return func() tea.Msg {
-		err := createWorktree(repoPath, branch, cfg)
+		_, err := createWorktree(repoPath, branch, cfg)
 		return worktreeCreatedMsg{
 			branch: branch,
 			err:    err,
@@ -1555,40 +1644,14 @@ func resolveRemoteBranchForSwitch(repoPath, branch string) (*remoteBranchMatch, 
 	return &matches[0], nil
 }
 
-func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) error {
+func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, config *Config) (string, error) {
 	if err := validateBranchName(worktreeName); err != nil {
-		return fmt.Errorf("invalid branch name: %w", err)
+		return "", fmt.Errorf("invalid branch name: %w", err)
 	}
 
-	// Determine worktree directory
-	worktreeDir := defaultWorktreeDir
-	if config != nil && config.WorktreeDir != "" {
-		worktreeDir = config.WorktreeDir
-	}
-
-	// Handle absolute vs relative paths
-	if !filepath.IsAbs(worktreeDir) {
-		worktreeDir = filepath.Join(repoPath, worktreeDir)
-	}
-
-	// Create worktree directory if it doesn't exist
-	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
-		return err
-	}
-
-	// Add worktree directory to git excludes if it's within the repo
-	if strings.HasPrefix(worktreeDir, repoPath) {
-		relPath, _ := filepath.Rel(repoPath, worktreeDir)
-		if relPath != "" && !strings.HasPrefix(relPath, "..") {
-			if err := ensureNoTrackedFiles(repoPath, relPath); err != nil {
-				return err
-			}
-			if err := ensureGitExcludeEntry(repoPath, relPath); err != nil {
-				// Don't fail the worktree creation if we can't update git excludes
-				// Just continue with a warning
-				fmt.Fprintf(os.Stderr, "Warning: Could not update git excludes: %v\n", err)
-			}
-		}
+	worktreeDir, err := ensureWorktreeDir(repoPath, config)
+	if err != nil {
+		return "", err
 	}
 
 	// Generate worktree path
@@ -1596,53 +1659,27 @@ func createWorktreeFromBranch(repoPath, worktreeName, sourceBranch string, confi
 
 	// Create worktree with new branch from source branch
 	args := []string{"worktree", "add", "-b", worktreeName, worktreePath, sourceBranch}
-	_, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
+	_, err = runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
 		// If branch already exists, try without -b flag
 		args = []string{"worktree", "add", worktreePath, worktreeName}
 		output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 		if err != nil {
-			return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
+			return "", fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 		}
 	}
 
-	return nil
+	return worktreePath, nil
 }
 
-func createWorktree(repoPath, branch string, config *Config) error {
+func createWorktree(repoPath, branch string, config *Config) (string, error) {
 	if err := validateBranchName(branch); err != nil {
-		return fmt.Errorf("invalid branch name: %w", err)
+		return "", fmt.Errorf("invalid branch name: %w", err)
 	}
 
-	// Determine worktree directory
-	worktreeDir := defaultWorktreeDir
-	if config != nil && config.WorktreeDir != "" {
-		worktreeDir = config.WorktreeDir
-	}
-
-	// Handle absolute vs relative paths
-	if !filepath.IsAbs(worktreeDir) {
-		worktreeDir = filepath.Join(repoPath, worktreeDir)
-	}
-
-	// Create worktree directory if it doesn't exist
-	if err := os.MkdirAll(worktreeDir, 0755); err != nil {
-		return err
-	}
-
-	// Add worktree directory to git excludes if it's within the repo
-	if strings.HasPrefix(worktreeDir, repoPath) {
-		relPath, _ := filepath.Rel(repoPath, worktreeDir)
-		if relPath != "" && !strings.HasPrefix(relPath, "..") {
-			if err := ensureNoTrackedFiles(repoPath, relPath); err != nil {
-				return err
-			}
-			if err := ensureGitExcludeEntry(repoPath, relPath); err != nil {
-				// Don't fail the worktree creation if we can't update git excludes
-				// Just continue with a warning
-				fmt.Fprintf(os.Stderr, "Warning: Could not update git excludes: %v\n", err)
-			}
-		}
+	worktreeDir, err := ensureWorktreeDir(repoPath, config)
+	if err != nil {
+		return "", err
 	}
 
 	// Generate worktree path
@@ -1661,18 +1698,18 @@ func createWorktree(repoPath, branch string, config *Config) error {
 	default:
 		match, err := resolveRemoteBranchForSwitch(repoPath, branch)
 		if err != nil {
-			return err
+			return "", err
 		}
 		remoteMatch = match
 		if remoteMatch != nil {
 			if remoteMatch.needsFetch {
 				if err := fetchRemoteBranch(repoPath, remoteMatch.remote, branch); err != nil {
-					return err
+					return "", err
 				}
 			}
 			fullRef := fmt.Sprintf("refs/remotes/%s/%s", remoteMatch.remote, branch)
 			if !refExists(repoPath, fullRef) {
-				return fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
+				return "", fmt.Errorf("failed to resolve remote branch %s", remoteMatch.ref)
 			}
 			// Use --no-track and set upstream explicitly afterwards. `--track`
 			// rejects start points that aren't covered by the remote's
@@ -1686,7 +1723,7 @@ func createWorktree(repoPath, branch string, config *Config) error {
 
 	output, err := runGitCmdCombinedWithTimeout(repoPath, worktreeCmdTimeout, args...)
 	if err != nil {
-		return fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
+		return "", fmt.Errorf("failed to create worktree: %s", strings.TrimSpace(string(output)))
 	}
 
 	// Point the new branch's upstream at the remote branch we used. Done by
@@ -1698,14 +1735,14 @@ func createWorktree(repoPath, branch string, config *Config) error {
 		mergeKey := fmt.Sprintf("branch.%s.merge", branch)
 		mergeRef := fmt.Sprintf("refs/heads/%s", branch)
 		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", remoteKey, remoteMatch.remote); err != nil {
-			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
 		}
 		if out, err := runGitCmdCombinedWithTimeout(repoPath, gitCmdTimeout, "config", mergeKey, mergeRef); err != nil {
-			return fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("failed to set upstream for %s: %s", branch, strings.TrimSpace(string(out)))
 		}
 	}
 
-	return nil
+	return worktreePath, nil
 }
 
 func deleteWorktree(repoPath, worktreePath string) error {
@@ -2239,6 +2276,8 @@ CONFIGURATION:
 
     Options:
     - worktree_dir: Directory for worktrees (default: .worktrees)
+                    Relative paths use the main worktree in normal repos
+                    Falls back to the current Git top-level otherwise
                     Use absolute path to place worktrees outside repo
                     Use "../" prefix to place worktrees as siblings
     - shell: Shell to use when switching (default: $SHELL or /bin/bash)
@@ -2497,29 +2536,20 @@ func main() {
 			config = &Config{}
 		}
 
-		// Create the worktree
+		// Create the worktree.
+		var worktreePath string
 		if sourceBranch != "" {
 			fmt.Printf("Creating worktree '%s' from branch '%s'...\n", worktreeName, sourceBranch)
-			err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
+			worktreePath, err = createWorktreeFromBranch(repoPath, worktreeName, sourceBranch, config)
 		} else {
 			fmt.Printf("Creating worktree '%s'...\n", worktreeName)
-			err = createWorktree(repoPath, worktreeName, config)
+			worktreePath, err = createWorktree(repoPath, worktreeName, config)
 		}
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error creating worktree: %v\n", err)
 			os.Exit(1)
 		}
-
-		// Determine worktree path
-		worktreeDir := defaultWorktreeDir
-		if config != nil && config.WorktreeDir != "" {
-			worktreeDir = config.WorktreeDir
-		}
-		if !filepath.IsAbs(worktreeDir) {
-			worktreeDir = filepath.Join(repoPath, worktreeDir)
-		}
-		worktreePath := filepath.Join(worktreeDir, strings.ReplaceAll(worktreeName, "/", "-"))
 
 		// Run post-create hook if configured
 		if err := runPostCreateHook(worktreePath, config); err != nil {
