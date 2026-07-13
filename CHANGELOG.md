@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-13
+
+### Added
+- Added lazygit-style GitHub pull request indicators to worktree rows, including open, closed, merged, loading, fork-parent, and tracked-branch states. (#12)
+
+### Fixed
+- Relative `worktree_dir` values now resolve from the main worktree when `gt` is run inside a linked worktree. (#11)
+
 ## [0.5.0] - 2026-06-03
 
 ### Added
